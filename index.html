@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>1v1 Web FPS (Rivals Style)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #87CEEB; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #gameUI { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; display: none; }
+        #crosshair { position: absolute; top: 50%; left: 50%; width: 10px; height: 10px; background-color: white; border: 1px solid black; border-radius: 50%; transform: translate(-50%, -50%); }
+        #hitMarker { position: absolute; top: 50%; left: 50%; width: 20px; height: 20px; border: 2px solid red; border-radius: 50%; transform: translate(-50%, -50%); display: none; }
+        #status { position: absolute; bottom: 20px; left: 20px; color: white; text-shadow: 2px 2px 0 #000; font-size: 24px; font-weight: bold; }
+        #damageOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: red; opacity: 0; transition: opacity 0.2s; }
+        
+        #menu { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.8); padding: 30px; border-radius: 10px; color: white; text-align: center; pointer-events: auto; }
+        input, button { padding: 10px; margin: 10px 0; font-size: 16px; width: 100%; box-sizing: border-box; }
+        button { background: #4CAF50; color: white; border: none; cursor: pointer; }
+        button:hover { background: #45a049; }
+        #instructions { font-size: 14px; color: #aaa; margin-top: 15px; }
+    </style>
+    <!-- Three.js & PeerJS & PointerLockControls 라이브러리 로드 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/PointerLockControls.js"></script>
+    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+</head>
+<body>
+
+    <!-- 메인 메뉴 (방 생성/참가) -->
+    <div id="menu">
+        <h2>🔥 1v1 M4 Arena</h2>
+        <div>
+            <h3>방 만들기 (Host)</h3>
+            <p>내 방 코드: <span id="myId" style="color:#4CAF50; font-weight:bold;">생성 중...</span></p>
+        </div>
+        <hr style="border-color: #333;">
+        <div>
+            <h3>방 참가하기 (Join)</h3>
+            <input type="text" id="joinId" placeholder="친구의 방 코드를 입력하세요">
+            <button onclick="joinGame()">게임 참가</button>
+        </div>
+        <div id="instructions">
+            [조작법]<br>W,A,S,D: 이동 | Space: 점프<br>좌클릭: 사격 | R: 장전<br>ESC: 마우스 잠금 해제
+        </div>
+    </div>
+
+    <!-- 게임 플레이 UI -->
+    <div id="gameUI">
+        <div id="damageOverlay"></div>
+        <div id="crosshair"></div>
+        <div id="hitMarker"></div>
+        <div id="status">
+            HP: <span id="hpUI" style="color: #4CAF50;">100</span> | 
+            M4: <span id="ammoUI">30</span> / 30 
+            <span id="reloadUI" style="color: yellow; display: none;">(장전 중...)</span>
+        </div>
+    </div>
+
+<script>
+    // --- 1. 게임 기본 상태 변수 ---
+    let camera, scene, renderer, controls;
+    let enemyGroup, enemyHead, enemyBody;
+    
+    // 플레이어 상태
+    let health = 100;
+    let ammo = 30;
+    const maxAmmo = 30;
+    let isReloading = false;
+    let lastCombatTime = Date.now(); // 회복 타이머용
+    
+    // 이동 물리 엔진
+    const velocity = new THREE.Vector3();
+    const direction = new THREE.Vector3();
+    let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
+    let canJump = false;
+    let prevTime = performance.now();
+
+    // 네트워크 상태
+    let peer, conn;
+    let isGameStarted = false;
+
+    // --- 2. 네트워크 (PeerJS) 설정 ---
+    function initNetwork() {
+        // 무료 공개 P2P 서버 사용
+        peer = new Peer();
+        
+        peer.on('open', (id) => {
+            document.getElementById('myId').innerText = id;
+        });
+
+        // 상대방이 내 방에 접속했을 때 (Host)
+        peer.on('connection', (connection) => {
+            conn = connection;
+            setupConnection();
+            startGame();
+        });
+    }
+
+    // 내가 상대방 방에 접속할 때 (Join)
+    function joinGame() {
+        const joinId = document.getElementById('joinId').value;
+        if (!joinId) return alert('코드를 입력하세요!');
+        conn = peer.connect(joinId);
+        conn.on('open', () => {
+            setupConnection();
+            startGame();
+        });
+    }
+
+    // 데이터 송수신 처리
+    function setupConnection() {
+        conn.on('data', (data) => {
+            if (data.type === 'move') {
+                // 상대방 이동 동기화
+                enemyGroup.position.set(data.x, data.y, data.z);
+                enemyGroup.rotation.y = data.ry;
+            } else if (data.type === 'hit') {
+                // 내가 맞았을 때 처리
+                takeDamage(data.damage);
+            }
+        });
+    }
+
+    // --- 3. 3D 그래픽 및 맵 설정 (Three.js) ---
+    function init3D() {
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB); // 하늘색
+        scene.fog = new THREE.Fog(0x87CEEB, 0, 100);
+
+        camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // 조명
+        const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+        light.position.set(0, 20, 0);
+        scene.add(light);
+        
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(-10, 20, 10);
+        scene.add(dirLight);
+
+        // 라이벌(Rivals) 스타일 심플 맵 (바닥 및 구조물)
+        const floorGeo = new THREE.PlaneGeometry(100, 100);
+        const floorMat = new THREE.MeshPhongMaterial({ color: 0x555555, depthWrite: false });
+        const floor = new THREE.Mesh(floorGeo, floorMat);
+        floor.rotation.x = -Math.PI / 2;
+        scene.add(floor);
+
+        const grid = new THREE.GridHelper(100, 40, 0x000000, 0x000000);
+        grid.material.opacity = 0.2;
+        grid.material.transparent = true;
+        scene.add(grid);
+
+        // 엄폐물 박스들 생성
+        const boxGeo = new THREE.BoxGeometry(4, 4, 4);
+        const boxMat = new THREE.MeshPhongMaterial({ color: 0x00aaee });
+        const positions = [ [10, 2, -10], [-10, 2, -10], [10, 2, 10], [-10, 2, 10], [0, 2, -20] ];
+        positions.forEach(pos => {
+            const box = new THREE.Mesh(boxGeo, boxMat);
+            box.position.set(...pos);
+            scene.add(box);
+        });
+
+        // 상대방 모델 (머리, 몸통 타격 판정 분리)
+        enemyGroup = new THREE.Group();
+        enemyGroup.position.set(0, -100, 0); // 시작 전엔 숨김
+
+        // 몸통
+        const bodyGeo = new THREE.BoxGeometry(1.2, 1.8, 0.8);
+        const bodyMat = new THREE.MeshPhongMaterial({ color: 0xff4444 });
+        enemyBody = new THREE.Mesh(bodyGeo, bodyMat);
+        enemyBody.position.y = 0.9;
+        enemyBody.name = "body";
+        enemyGroup.add(enemyBody);
+
+        // 머리
+        const headGeo = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+        const headMat = new THREE.MeshPhongMaterial({ color: 0xffaaaa });
+        enemyHead = new THREE.Mesh(headGeo, headMat);
+        enemyHead.position.y = 2.2;
+        enemyHead.name = "head";
+        enemyGroup.add(enemyHead);
+
+        scene.add(enemyGroup);
+
+        // 컨트롤 설정 (마우스 화면 잠금)
+        controls = new THREE.PointerLockControls(camera, document.body);
+        scene.add(controls.getObject());
+        controls.getObject().position.set(0, 2, 10); // 시작 위치
+    }
+
+    // --- 4. 게임 핵심 로직 (사격, 재장전, 데미지, 회복) ---
+    function startGame() {
+        if(isGameStarted) return;
+        isGameStarted = true;
+        
+        document.getElementById('menu').style.display = 'none';
+        document.getElementById('gameUI').style.display = 'block';
+        
+        document.body.addEventListener('click', () => {
+            if(isGameStarted) controls.lock();
+        });
+
+        setupInputs();
+        animate();
+    }
+
+    function setupInputs() {
+        const onKeyDown = (event) => {
+            switch (event.code) {
+                case 'ArrowUp': case 'KeyW': moveForward = true; break;
+                case 'ArrowLeft': case 'KeyA': moveLeft = true; break;
+                case 'ArrowDown': case 'KeyS': moveBackward = true; break;
+                case 'ArrowRight': case 'KeyD': moveRight = true; break;
+                case 'Space': if (canJump) velocity.y += 10; canJump = false; break;
+                case 'KeyR': reloadM4(); break;
+            }
+        };
+        const onKeyUp = (event) => {
+            switch (event.code) {
+                case 'ArrowUp': case 'KeyW': moveForward = false; break;
+                case 'ArrowLeft': case 'KeyA': moveLeft = false; break;
+                case 'ArrowDown': case 'KeyS': moveBackward = false; break;
+                case 'ArrowRight': case 'KeyD': moveRight = false; break;
+            }
+        };
+
+        // 사격 이벤트
+        document.addEventListener('mousedown', (e) => {
+            if(controls.isLocked && e.button === 0) shoot();
+        });
+
+        document.addEventListener('keydown', onKeyDown);
+        document.addEventListener('keyup', onKeyUp);
+    }
+
+    const raycaster = new THREE.Raycaster();
+    function shoot() {
+        if (isReloading) return;
+        
+        if (ammo <= 0) {
+            reloadM4();
+            return;
+        }
+
+        ammo--;
+        updateUI();
+        lastCombatTime = Date.now(); // 사격 시 회복 타이머 초기화
+
+        // 반동 시각 효과 (화면 살짝 위로)
+        camera.rotation.x += 0.02;
+
+        // 레이캐스팅(총알 궤적 계산)
+        raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+        const intersects = raycaster.intersectObjects(enemyGroup.children);
+
+        if (intersects.length > 0) {
+            const hitPart = intersects[0].object.name;
+            let dmg = 20; // 기본/팔다리
+            if (hitPart === 'head') dmg = 100;
+            if (hitPart === 'body') dmg = 35;
+
+            // 명중 마커 표시
+            const marker = document.getElementById('hitMarker');
+            marker.style.display = 'block';
+            setTimeout(() => marker.style.display = 'none', 100);
+
+            // 상대방에게 데미지 데이터 전송
+            if(conn && conn.open) {
+                conn.send({ type: 'hit', damage: dmg });
+            }
+        }
+    }
+
+    function reloadM4() {
+        if(isReloading || ammo === maxAmmo) return;
+        isReloading = true;
+        document.getElementById('reloadUI').style.display = 'inline';
+        
+        // 장전 시간 2.5초
+        setTimeout(() => {
+            ammo = maxAmmo;
+            isReloading = false;
+            document.getElementById('reloadUI').style.display = 'none';
+            updateUI();
+        }, 2500);
+    }
+
+    function takeDamage(amount) {
+        health -= amount;
+        lastCombatTime = Date.now(); // 맞았을 때 회복 타이머 초기화
+        
+        // 피격 화면 붉은 효과
+        const overlay = document.getElementById('damageOverlay');
+        overlay.style.opacity = 0.5;
+        setTimeout(() => overlay.style.opacity = 0, 150);
+
+        if (health <= 0) {
+            alert('죽었습니다! 리스폰 됩니다.');
+            health = 100;
+            ammo = maxAmmo;
+            controls.getObject().position.set(Math.random()*10 - 5, 2, Math.random()*10 - 5);
+        }
+        updateUI();
+    }
+
+    // 10초 비전투 시 체력 회복 로직
+    setInterval(() => {
+        if (!isGameStarted) return;
+        const timePassed = (Date.now() - lastCombatTime) / 1000;
+        if (timePassed >= 10 && health < 100) {
+            health = Math.min(100, health + 5); // 1초에 5씩 회복
+            updateUI();
+        }
+    }, 1000);
+
+    function updateUI() {
+        document.getElementById('hpUI').innerText = health;
+        document.getElementById('hpUI').style.color = health > 50 ? '#4CAF50' : 'red';
+        document.getElementById('ammoUI').innerText = ammo;
+    }
+
+    // --- 5. 렌더링 루프 ---
+    function animate() {
+        requestAnimationFrame(animate);
+
+        const time = performance.now();
+        if (controls.isLocked === true) {
+            const delta = (time - prevTime) / 1000;
+
+            velocity.x -= velocity.x * 10.0 * delta;
+            velocity.z -= velocity.z * 10.0 * delta;
+            velocity.y -= 9.8 * 3.0 * delta; // 중력
+
+            direction.z = Number(moveForward) - Number(moveBackward);
+            direction.x = Number(moveRight) - Number(moveLeft);
+            direction.normalize();
+
+            if (moveForward || moveBackward) velocity.z -= direction.z * 40.0 * delta;
+            if (moveLeft || moveRight) velocity.x -= direction.x * 40.0 * delta;
+
+            controls.moveRight(-velocity.x * delta);
+            controls.moveForward(-velocity.z * delta);
+            controls.getObject().position.y += (velocity.y * delta);
+
+            // 바닥 충돌 처리
+            if (controls.getObject().position.y < 2) {
+                velocity.y = 0;
+                controls.getObject().position.y = 2;
+                canJump = true;
+            }
+
+            // 내 위치를 상대방에게 실시간 전송 (초당 60프레임 동기화)
+            if(conn && conn.open) {
+                const pos = controls.getObject().position;
+                // 플레이어의 시선 방향 (Y축 회전값만 추출)
+                const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+                conn.send({
+                    type: 'move',
+                    x: pos.x, y: pos.y - 2, z: pos.z, // 바닥 기준 위치 조정
+                    ry: euler.y
+                });
+            }
+        }
+        prevTime = time;
+        renderer.render(scene, camera);
+    }
+
+    // 윈도우 리사이즈 대응
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // 게임 초기화 실행
+    initNetwork();
+    init3D();
+
+</script>
+</body>
+</html>
